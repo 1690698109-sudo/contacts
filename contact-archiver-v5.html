@@ -472,7 +472,7 @@ async function parseAndAdd(){
   document.getElementById('thinking').classList.add('on');
 
   try{
-    const res = await fetch('https://api.anthropic.com/v1/messages',{
+    const res = await fetch('https://feishu-proxy.1690698109.workers.dev/anthropic/v1/messages',{
       method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({
         model:'claude-sonnet-4-20250514', max_tokens:1500,
@@ -554,17 +554,98 @@ function showMapModal(headers){
 function confirmImport(){
   const mapping = {};
   FIELDS.forEach(f => { const v=document.getElementById('map-'+f).value; if(v) mapping[f]=v; });
-  const ex = new Set(contacts.map(c=>c.phone).filter(Boolean));
-  let imported=0, dupes=0;
-  pendingRows.forEach(row => {
-    const c = {id:uid(), createdAt:new Date().toLocaleDateString('zh-CN'), cat:'其他'};
-    FIELDS.forEach(f => { if(mapping[f]){ const idx=pendingHeaders.indexOf(mapping[f]); if(idx>=0) c[f]=String(row[idx]||'').trim(); } });
-    if(!c.name&&!c.phone) return;
-    if(c.phone&&ex.has(c.phone)){ dupes++; return; }
-    contacts.push(c); if(c.phone) ex.add(c.phone); imported++;
-  });
-  save(); closeModal(); renderFilterBar(); renderCards();
-  showToast(`已导入 ${imported} 条${dupes?`，${dupes} 条重复跳过`:''}`);
+  closeModal();
+  showToast('导入中，请稍候...');
+  // Async to avoid blocking UI
+  setTimeout(()=>{
+    const ex = new Set(contacts.map(c=>c.phone).filter(Boolean));
+    let imported=0, dupes=0;
+    const newIds=[];
+    // Process in chunks of 50 to avoid freezing
+    let i=0;
+    function processChunk(){
+      const end=Math.min(i+50,pendingRows.length);
+      for(;i<end;i++){
+        const row=pendingRows[i];
+        const c = {id:uid(), createdAt:new Date().toLocaleDateString('zh-CN'), cat:'其他'};
+        FIELDS.forEach(f => { if(mapping[f]){ const idx=pendingHeaders.indexOf(mapping[f]); if(idx>=0) c[f]=String(row[idx]||'').trim(); } });
+        if(!c.name&&!c.phone) continue;
+        if(c.phone&&ex.has(c.phone)){ dupes++; continue; }
+        contacts.push(c); newIds.push(c.id);
+        if(c.phone) ex.add(c.phone); imported++;
+      }
+      if(i<pendingRows.length){
+        showToast(`导入中 ${i}/${pendingRows.length}...`);
+        setTimeout(processChunk, 10);
+      } else {
+        save(); renderFilterBar(); renderCards();
+        showToast(`已导入 ${imported} 条${dupes?`，${dupes} 条重复跳过`:''}`);
+        // Show AI clean button if imported something
+        if(imported>0 && newIds.length>0){
+          showCleanBtn(newIds);
+        }
+      }
+    }
+    processChunk();
+  }, 50);
+}
+
+function showCleanBtn(ids){
+  const area = document.getElementById('cards-area');
+  const banner = document.createElement('div');
+  banner.id = 'clean-banner';
+  banner.style.cssText = 'background:rgba(126,232,162,.08);border:1px solid rgba(126,232,162,.2);border-radius:9px;padding:10px 14px;margin-bottom:10px;display:flex;align-items:center;justify-content:space-between;gap:10px';
+  banner.innerHTML = `
+    <span style="font-size:12px;color:var(--accent)">检测到导入数据可能含有混合字段（如"姓名+职位"在同一列）</span>
+    <button onclick="aiClean(${JSON.stringify(ids)})" style="font-size:11px;padding:5px 14px;background:rgba(126,232,162,.15);border:1px solid rgba(126,232,162,.3);border-radius:6px;color:var(--accent);cursor:pointer;white-space:nowrap;font-family:var(--mono)">AI 智能拆分</button>
+  `;
+  area.prepend(banner);
+}
+
+async function aiClean(ids){
+  const banner = document.getElementById('clean-banner');
+  if(banner) banner.innerHTML = '<span style="font-size:12px;color:var(--muted);font-family:var(--mono)">⟳ AI 正在分析拆分，请稍候...</span>';
+  const toClean = contacts.filter(c=>ids.includes(c.id));
+  // Process in batches of 10
+  let cleaned=0;
+  for(let i=0;i<toClean.length;i+=10){
+    const batch = toClean.slice(i,i+10);
+    try{
+      const res = await fetch('https://feishu-proxy.1690698109.workers.dev/anthropic/v1/messages',{
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({
+          model:'claude-sonnet-4-20250514', max_tokens:2000,
+          messages:[{role:'user', content:
+`以下是从 Excel 导入的联系人数据，部分字段可能混合了多个信息（如姓名和职位在同一字段，或地区和单位名称在同一字段）。请智能拆分并返回修正后的 JSON 数组，不要任何其他内容，不要 markdown。
+
+每个对象保持原有字段，只修正明显混合的字段：
+- name: 只保留姓名（2-4个汉字），如原字段含职位则拆出
+- title: 职位/职务
+- org: 只保留单位名称，去掉地区前缀
+- province: 如能从org或city字段识别出省份（北京/天津/内蒙古/黑龙江/吉林/辽宁）则填入
+- city: 地级市或区
+
+数据：
+${JSON.stringify(batch.map(c=>({id:c.id,name:c.name,title:c.title,org:c.org,province:c.province,city:c.city})))}`
+          }]
+        })
+      });
+      const data = await res.json();
+      const raw = data.content.map(b=>b.text||'').join('').replace(/```json|```/g,'').trim();
+      const fixed = JSON.parse(raw);
+      fixed.forEach(f=>{
+        const idx=contacts.findIndex(c=>c.id===f.id);
+        if(idx>=0){
+          contacts[idx]={...contacts[idx],...f};
+          cleaned++;
+        }
+      });
+    }catch(e){ console.error(e); }
+    if(banner) banner.innerHTML = `<span style="font-size:12px;color:var(--muted);font-family:var(--mono)">⟳ 已处理 ${Math.min(i+10,toClean.length)}/${toClean.length}...</span>`;
+  }
+  save(); renderFilterBar(); renderCards();
+  if(banner) banner.remove();
+  showToast(`AI 已智能拆分 ${cleaned} 条记录`);
 }
 
 function closeModal(){
@@ -809,26 +890,42 @@ function renderCards(){
   area.innerHTML=list.map(c=>{
     const comp=[c.name,c.phone,c.title,c.org].filter(Boolean).length;
     const pct=Math.round(comp/4*100);
-    const gp=[c.province,c.city,c.cat].filter(Boolean).join(' › ');
+    const gp=[c.province,c.city].filter(Boolean).join(' › ');
     const cc=CAT_C[c.cat]||CAT_C['其他'];
+    const initials=(c.name||'?').slice(0,1);
     return `<div class="contact-card" id="card-${c.id}">
-      <div class="card-top">
-        <div>
-          <div class="card-name">${c.name||'<span style="color:var(--muted);font-size:11px">未知姓名</span>'}</div>
-          <div class="card-sub">${[c.title,c.org].filter(Boolean).join(' · ')||''}</div>
+      <div style="display:flex;gap:10px;align-items:flex-start;margin-bottom:8px">
+        <div style="width:40px;height:40px;border-radius:50%;background:${cc}22;display:flex;align-items:center;justify-content:center;font-size:16px;font-weight:500;color:${cc};flex-shrink:0">${initials}</div>
+        <div style="flex:1;min-width:0">
+          <div style="font-size:16px;font-weight:500;color:var(--text);line-height:1.2;margin-bottom:3px">${c.name||'<span style="color:var(--muted);font-size:12px">未知姓名</span>'}</div>
+          <div style="font-size:12px;color:var(--muted)">${[c.title,c.org].filter(Boolean).join(' · ')||'<span style="color:rgba(255,255,255,.15)">暂无职位/单位</span>'}</div>
+          ${gp||c.cat?`<div style="display:flex;gap:4px;margin-top:4px;flex-wrap:wrap">
+            ${gp?`<span style="font-size:10px;color:var(--muted);font-family:var(--mono)">${gp}</span>`:''}
+            ${c.cat?`<span style="font-size:10px;padding:1px 6px;border-radius:3px;background:${cc}18;color:${cc};font-family:var(--mono)">${c.cat}</span>`:''}
+            ${c.fsRecordId?`<span style="font-size:10px;color:var(--accent2);font-family:var(--mono)">☁</span>`:''}
+          </div>`:''}
         </div>
-        <div class="badges">
-          <span class="badge" style="background:${pct===100?'rgba(126,232,162,.1)':'rgba(246,173,85,.1)'};color:${pct===100?'var(--accent)':'var(--warn)'}">${pct===100?'COMPLETE':pct+'%'}</span>
-          ${c.cat?`<span class="badge" style="background:${cc}18;color:${cc}">${c.cat}</span>`:''}
-          ${c.fsRecordId?`<span class="badge" style="background:rgba(79,209,197,.08);color:var(--accent2)">☁</span>`:''}
+        <div style="display:flex;flex-direction:column;align-items:flex-end;gap:4px;flex-shrink:0">
+          <span style="font-size:9px;font-family:var(--mono);padding:2px 6px;border-radius:3px;background:${pct===100?'rgba(126,232,162,.1)':'rgba(246,173,85,.1)'};color:${pct===100?'var(--accent)':'var(--warn)'}">${pct===100?'✓':''+pct+'%'}</span>
         </div>
       </div>
-      ${gp?`<div class="gp-path">${gp}</div>`:''}
-      <div class="card-fields">
-        <div><div class="cf-l">PHONE</div><div class="cf-v ${c.phone?'':'empty'}">${c.phone||'—'}</div></div>
-        <div><div class="cf-l">EMAIL</div><div class="cf-v ${c.email?'':'empty'}">${c.email||'—'}</div></div>
-        <div><div class="cf-l">WECHAT</div><div class="cf-v ${c.wx?'':'empty'}">${c.wx||'—'}</div></div>
-        <div><div class="cf-l">NOTE</div><div class="cf-v ${c.note?'':'empty'}">${c.note||'—'}</div></div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;padding:8px;background:var(--surface2);border-radius:6px;margin-bottom:6px">
+        <div>
+          <div style="font-size:9px;color:var(--muted);font-family:var(--mono);margin-bottom:2px">电话</div>
+          <div style="font-size:13px;color:${c.phone?'var(--text)':'rgba(255,255,255,.2)'};font-family:${c.phone?'var(--mono)':'var(--sans)'}">${c.phone||'—'}</div>
+        </div>
+        <div>
+          <div style="font-size:9px;color:var(--muted);font-family:var(--mono);margin-bottom:2px">微信</div>
+          <div style="font-size:13px;color:${c.wx?'var(--text)':'rgba(255,255,255,.2)'}">${c.wx||'—'}</div>
+        </div>
+        <div>
+          <div style="font-size:9px;color:var(--muted);font-family:var(--mono);margin-bottom:2px">邮箱</div>
+          <div style="font-size:12px;color:${c.email?'var(--text)':'rgba(255,255,255,.2)'}">${c.email||'—'}</div>
+        </div>
+        <div>
+          <div style="font-size:9px;color:var(--muted);font-family:var(--mono);margin-bottom:2px">备注</div>
+          <div style="font-size:12px;color:${c.note?'var(--text)':'rgba(255,255,255,.2)'}">${c.note||'—'}</div>
+        </div>
       </div>
       <div class="prog"><div class="prog-fill" style="width:${pct}%"></div></div>
       <div class="card-foot">
