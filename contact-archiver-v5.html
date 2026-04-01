@@ -489,7 +489,10 @@ note其他备注。
       })
     });
     const data = await res.json();
-    let parsed = JSON.parse(data.content.map(b=>b.text||'').join('').replace(/```json|```/g,'').trim());
+    if(!data.content) throw new Error(data.error?.message||JSON.stringify(data).slice(0,200));
+    const rawText = data.content.map(b=>b.text||'').join('').replace(/```json|```/g,'').trim();
+    let parsed;
+    try{ parsed=JSON.parse(rawText); }catch(e){ throw new Error('AI返回格式异常，请重试'); }
     if(!Array.isArray(parsed)) parsed=[parsed];
 
     const ex = new Set(contacts.map(c=>c.phone).filter(Boolean));
