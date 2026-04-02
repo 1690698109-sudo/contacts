@@ -226,7 +226,7 @@ select option{background:#1e1e21}
   </div>
 
   <button class="parse-btn" id="parse-btn" onclick="parseAndAdd()">
-    <span class="id">✦ AI 解析并归档</span>
+    <span class="id">✦ 解析并归档</span>
     <span class="ld">⟳ 解析中...</span>
   </button>
 
@@ -393,6 +393,7 @@ function init(){
   if(fsConfig.appid) document.getElementById('fs-appid').value = fsConfig.appid;
   if(fsConfig.secret) document.getElementById('fs-secret').value = fsConfig.secret;
   if(fsConfig.url)   document.getElementById('fs-url').value   = fsConfig.url;
+  if(fsConfig.anthropicKey) document.getElementById('fs-akey').value = fsConfig.anthropicKey;
   if(fsConfig.token) document.getElementById('fs-token').value = fsConfig.token;
   if(fsConfig.table) document.getElementById('fs-table').value = fsConfig.table;
   renderFilterBar(); renderCards();
@@ -460,7 +461,112 @@ function setCity(c){ filt.city=c; filt.cat=null; renderFilterBar(); renderCards(
 function setCat(c){  filt.cat=c;  renderFilterBar(); renderCards(); }
 
 // ── AI PARSE ──
-async function parseAndAdd(){
+// ── 本地规则解析 ──
+function localParse(text){
+  const TITLES = ['主任','副主任','局长','副局长','主席','副主席','书记','副书记','总监','副总监','经理','副经理','部长','副部长','处长','副处长','科长','副科长','秘书长','副秘书长','会长','副会长','理事长','台长','副台长','站长','院长','副院长','所长','副所长','委员','专员','干事','编辑','记者','主播','导演','制片','总编','副总编','总裁','董事'];
+  const CATS_KW = {'社科联':['社科联','社会科学'],'残联':['残联','残疾人联合'],'广电':['广电','广播','电视台','传媒','融媒'],'文旅':['文旅','文化','旅游','文广']};
+  const PROVS = ['北京','天津','内蒙古','黑龙江','吉林','辽宁'];
+  
+  // Split by newline or common separators for multi-person
+  const blocks = text.split(/\n+/).filter(l=>l.trim());
+  const results = [];
+  
+  // Try to parse each line or group of lines as one person
+  // First try line-by-line (one person per line)
+  const singleLine = blocks.length > 1 && blocks.every(b => /\d{7,}/.test(b) || b.length < 30);
+  
+  if(singleLine){
+    blocks.forEach(line => {
+      const c = parseLine(line.trim());
+      if(c) results.push(c);
+    });
+  } else {
+    // Treat whole text as one person
+    const c = parseLine(text.replace(/\n/g,' '));
+    if(c) results.push(c);
+  }
+  
+  return results;
+  
+  function parseLine(line){
+    if(!line) return null;
+    const c = {name:'',phone:'',title:'',org:'',wx:'',email:'',province:'',city:'',cat:'其他',note:''};
+    
+    // Extract phone (11 digits starting with 1, or with dashes)
+    const phoneMatch = line.match(/1[3-9]\d[\s-]?\d{4}[\s-]?\d{4}/);
+    if(phoneMatch){ c.phone = phoneMatch[0].replace(/[\s-]/g,''); line = line.replace(phoneMatch[0],''); }
+    
+    // Extract email
+    const emailMatch = line.match(/[\w.+-]+@[\w-]+\.[\w.]+/);
+    if(emailMatch){ c.email = emailMatch[0]; line = line.replace(emailMatch[0],''); }
+    
+    // Clean separators
+    const parts = line.split(/[\s　,，、·]+/).filter(p=>p.trim());
+    
+    // Identify each part
+    const unmatched = [];
+    parts.forEach(p => {
+      // Province
+      const prov = PROVS.find(v => p.includes(v));
+      if(prov && !c.province){ c.province = prov; }
+      
+      // Category
+      let matched = false;
+      for(const [cat, kws] of Object.entries(CATS_KW)){
+        if(kws.some(k=>p.includes(k))){ c.cat=cat; matched=true; break; }
+      }
+      
+      // Title
+      const titleMatch = TITLES.find(t => p.includes(t));
+      if(titleMatch && !c.title){ c.title = p; return; }
+      
+      // Org: contains org keywords or is long
+      if(p.includes('联') || p.includes('局') || p.includes('台') || p.includes('院') || 
+         p.includes('所') || p.includes('会') || p.includes('部') || p.includes('中心') ||
+         p.includes('委') || p.length > 6){
+        if(!c.org){ c.org = p; return; }
+      }
+      
+      // Name: 2-4 Chinese chars, no digits
+      if(/^[\u4e00-\u9fa5]{2,4}$/.test(p) && !c.name){ c.name = p; return; }
+      
+      unmatched.push(p);
+    });
+    
+    // If org not found, try to find longest non-name non-title part
+    if(!c.org && unmatched.length){
+      const orgCandidate = unmatched.find(p => p.length > 3);
+      if(orgCandidate) c.org = orgCandidate;
+    }
+    
+    // Extract city from org or province context
+    if(c.org){
+      // Check if org starts with a city name
+      const allCities = Object.values(GEO).flat();
+      const cityInOrg = allCities.find(city => c.org.startsWith(city));
+      if(cityInOrg){ 
+        if(!c.city) c.city = cityInOrg;
+        // Find province for this city
+        if(!c.province){
+          for(const [prov,cities] of Object.entries(GEO)){
+            if(cities.includes(cityInOrg)){ c.province=prov; break; }
+          }
+        }
+        c.org = c.org.slice(cityInOrg.length); // remove city prefix from org
+      }
+      // Also check province prefix in org
+      if(!c.province){
+        const provInOrg = PROVS.find(p => c.org.startsWith(p));
+        if(provInOrg){ c.province=provInOrg; c.org=c.org.slice(provInOrg.length); }
+      }
+    }
+    
+    if(!c.name && !c.phone && !c.org) return null;
+    return c;
+  }
+}
+
+function parseAndAdd(){
   const text = document.getElementById('paste-input').value.trim();
   if(!text){ showToast('请先粘贴联系方式文字'); return; }
   const mProv = document.getElementById('sel-prov').value;
@@ -469,31 +575,10 @@ async function parseAndAdd(){
 
   const btn = document.getElementById('parse-btn');
   btn.classList.add('busy'); btn.disabled = true;
-  document.getElementById('thinking').classList.add('on');
 
   try{
-    const res = await fetch('https://feishu-proxy.1690698109.workers.dev/anthropic/v1/messages',{
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({
-        model:'claude-sonnet-4-20250514', max_tokens:1500,
-        messages:[{role:'user', content:
-`从以下文本中提取所有联系人，返回JSON数组，不要任何其他内容，不要markdown。
-
-字段：name姓名、phone电话、title职位、org所属单位、wx微信号、email邮箱、
-province省份(只能是:北京/天津/内蒙古/黑龙江/吉林/辽宁,不确定则空)、
-city地级市或区(北京天津填区名,其他省填地级市,不确定则空)、
-cat行业类别(只能是:社科联/残联/广电/文旅/其他,不确定则"其他")、
-note其他备注。
-
-文本：\n${text}`}]
-      })
-    });
-    const data = await res.json();
-    if(!data.content) throw new Error(data.error?.message||JSON.stringify(data).slice(0,200));
-    const rawText = data.content.map(b=>b.text||'').join('').replace(/```json|```/g,'').trim();
-    let parsed;
-    try{ parsed=JSON.parse(rawText); }catch(e){ throw new Error('AI返回格式异常，请重试'); }
-    if(!Array.isArray(parsed)) parsed=[parsed];
+    const parsed = localParse(text);
+    if(!parsed.length){ showToast('未识别到联系人信息'); return; }
 
     const ex = new Set(contacts.map(c=>c.phone).filter(Boolean));
     let added=0, dupes=0;
@@ -501,7 +586,10 @@ note其他备注。
     for(const c of parsed){
       if(!c.phone&&!c.name) continue;
       if(c.phone&&ex.has(c.phone)){ dupes++; continue; }
-      const nc = {...c, province:mProv||c.province||'', city:mCity||c.city||'', cat:mCat||c.cat||'其他',
+      const nc = {...c,
+        province: mProv||c.province||'',
+        city:     mCity||c.city||'',
+        cat:      mCat||c.cat||'其他',
         id:uid(), createdAt:new Date().toLocaleDateString('zh-CN')};
       contacts.unshift(nc); newIds.push(nc.id);
       if(nc.phone) ex.add(nc.phone); added++;
@@ -515,7 +603,7 @@ note其他备注。
       if(el){el.classList.add('flash');setTimeout(()=>el.classList.remove('flash'),800)}
     }),150);
   }catch(e){ showToast('解析失败：'+e.message); }
-  finally{ btn.classList.remove('busy'); btn.disabled=false; document.getElementById('thinking').classList.remove('on'); }
+  finally{ btn.classList.remove('busy'); btn.disabled=false; }
 }
 
 // ── EXCEL IMPORT ──
@@ -615,7 +703,7 @@ async function aiClean(ids){
     const batch = toClean.slice(i,i+10);
     try{
       const res = await fetch('https://feishu-proxy.1690698109.workers.dev/anthropic/v1/messages',{
-        method:'POST', headers:{'Content-Type':'application/json'},
+        method:'POST', headers:{'Content-Type':'application/json','x-api-key':fsConfig.anthropicKey||'','anthropic-version':'2023-06-01'},
         body: JSON.stringify({
           model:'claude-sonnet-4-20250514', max_tokens:2000,
           messages:[{role:'user', content:
@@ -701,7 +789,8 @@ function fsSaveConfig(){
     token:  document.getElementById('fs-token').value.trim(),
     table:  document.getElementById('fs-table').value.trim(),
     url:    document.getElementById('fs-url').value.trim(),
-    isWiki: fsConfig.isWiki || false
+    isWiki: fsConfig.isWiki || false,
+    anthropicKey: document.getElementById('fs-akey').value.trim()
   };
   localStorage.setItem('fs_config', JSON.stringify(fsConfig));
 }
